@@ -1,0 +1,6 @@
+#!/usr/bin/env bash
+# SPDX-FileCopyrightText: 2026 shebangai <shebangai.dev@gmail.com>
+# SPDX-License-Identifier: GPL-3.0-only
+# Forward execution to the actual binary using sudo.
+# This ensures stdin (the JSON payload) is correctly piped through.
+exec sudo /opt/cemi/bin/pkgctl "$@"

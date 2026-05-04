@@ -1,0 +1,448 @@
+#!/usr/bin/env bash
+# SPDX-FileCopyrightText: 2026 shebangai <shebangai.dev@gmail.com>
+# SPDX-License-Identifier: GPL-3.0-only
+# ============================================================
+# PKGCTL v0.1.0 - Self-correcting agent tool
+# ============================================================
+set -euo pipefail
+IFS=$'\n\t'
+
+PATH=/usr/sbin:/usr/bin:/sbin:/bin
+
+readonly LOCKFILE="/tmp/pkgctl.lock"
+readonly JOURNAL_FILE="/tmp/pkgctl-journal.ndjson"
+
+# ---------------------------------------------------------------------------
+# Global state — populated by _extract / _extract_pkgs / _extract_flags
+# ---------------------------------------------------------------------------
+ACTION=""
+DRY_RUN="false"
+PKGS_JSON="[]"
+PKGS=()     # bash array — no word-splitting ever needed
+FLAGS=()    # bash array — no word-splitting ever needed
+PM=""
+INPUT=""
+
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+
+_now() {
+    date -u +"%Y-%m-%dT%H:%M:%SZ"
+}
+
+_usage_template() {
+    cat <<'EOF'
+{
+  "action": "install|remove|update|source|search",
+  "packages": ["pkg1"],
+  "flags": ["-y"],
+  "dry_run": false
+}
+EOF
+}
+
+_example_for_action() {
+    case "$1" in
+        install) cat <<'EOF'
+{
+  "action": "install",
+  "packages": ["curl", "jq"],
+  "flags": ["-y"],
+  "dry_run": false
+}
+EOF
+            ;;
+        remove) cat <<'EOF'
+{
+  "action": "remove",
+  "packages": ["curl"],
+  "dry_run": false
+}
+EOF
+            ;;
+        update) cat <<'EOF'
+{
+  "action": "update"
+}
+EOF
+            ;;
+        source) cat <<'EOF'
+{
+  "action": "source",
+  "packages": ["bash"]
+}
+EOF
+            ;;
+        search) cat <<'EOF'
+{
+  "action": "search",
+  "packages": ["libax25"]
+}
+EOF
+            ;;
+    esac
+}
+
+_error() {
+    local code="$1"
+    local msg="$2"
+    local action_hint="${ACTION:-install}"
+
+    jq -n \
+        --arg      code    "$code" \
+        --arg      msg     "$msg" \
+        --argjson  usage   "$(_usage_template)" \
+        --argjson  example "$(_example_for_action "$action_hint")" \
+        '{type:"error", code:$code, message:$msg, usage:$usage, example:$example}' >&2
+
+    exit 1
+}
+
+_detect_pm() {
+    if   command -v apt-get >/dev/null 2>&1; then printf '%s' "apt-get"
+    elif command -v dnf     >/dev/null 2>&1; then printf '%s' "dnf"
+    elif command -v yum     >/dev/null 2>&1; then printf '%s' "yum"
+    elif command -v apk     >/dev/null 2>&1; then printf '%s' "apk"
+    else printf '%s' ""
+    fi
+}
+
+_emit() {
+    local json="$1"
+    printf '%s\n' "$json"
+    # Only append 'journal' type events to the journal file
+    if [[ "$(printf '%s' "$json" | jq -r '.type')" == "journal" ]]; then
+        printf '%s\n' "$json" >> "$JOURNAL_FILE"
+    fi
+}
+
+_acquire_lock() {
+    exec 9>"$LOCKFILE"
+    command -v flock >/dev/null 2>&1 || return 0
+    # Use -n (non-blocking) to avoid hanging; return LOCKED error if busy
+    flock -n 9 || _error "LOCKED" "package manager already running"
+}
+
+# ---------------------------------------------------------------------------
+# Input parsing
+# ---------------------------------------------------------------------------
+
+_validate() {
+    command -v jq >/dev/null 2>&1 || _error "NO_JQ" "jq is required"
+
+    printf '%s' "$INPUT" | jq -e '
+        (.action   | type == "string") and
+        (.packages | type == "array"   or . == null) and
+        (.flags    | type == "array"   or . == null) and
+        (.dry_run  | type == "boolean" or . == null)
+    ' >/dev/null 2>&1 || _error "INVALID_SCHEMA" "input JSON failed validation"
+}
+
+_extract() {
+    ACTION="$(  printf '%s' "$INPUT" | jq -r '.action')"
+    DRY_RUN="$( printf '%s' "$INPUT" | jq -r '.dry_run // false')"
+    PKGS_JSON="$(printf '%s' "$INPUT" | jq -c '.packages // []')"
+}
+
+_extract_pkgs() {
+    # Populate the PKGS bash array using mapfile + NUL-delimited jq output.
+    # Splitting on NUL means package names with spaces, tabs, newlines, or
+    # glob characters are all handled correctly — no word-splitting involved.
+    mapfile -d $'\0' PKGS < <(
+        printf '%s' "$INPUT" | jq -j '.packages[]? | (., "\u0000")'
+    )
+}
+
+_extract_flags() {
+    # Same NUL-delimited mapfile pattern for flags.
+    local raw_flags=()
+    mapfile -d $'\0' raw_flags < <(
+        printf '%s' "$INPUT" | jq -j '.flags[]? | (., "\u0000")'
+    )
+
+    FLAGS=()
+    local f
+    for f in "${raw_flags[@]+"${raw_flags[@]}"}"; do
+        case "$f" in
+            -y|--no-weak-deps)
+                FLAGS+=("$f")
+                ;;
+            '')
+                ;;  # skip empty entries (shouldn't occur with NUL delimiter)
+            *)
+                _error "INVALID_FLAG" "unsupported flag: $f"
+                ;;
+        esac
+    done
+}
+
+# ---------------------------------------------------------------------------
+# Command runner
+# ---------------------------------------------------------------------------
+
+_run() {
+    # Build a JSON array of the exact argv for structured, injection-safe logging.
+    # NUL-delimited printf | jq guarantees correct encoding of any argument value.
+    local cmd_json
+    cmd_json="$(printf '%s\0' "$@" | jq -Rs 'split("\u0000") | map(select(. != ""))')"
+
+    _emit "$(jq -n \
+        --arg     ts      "$(_now)" \
+        --arg     action  "$ACTION" \
+        --arg     pm      "$PM" \
+        --argjson cmd     "$cmd_json" \
+        --argjson dry_run "$DRY_RUN" \
+        '{type:"event", ts:$ts, action:$action, pm:$pm, cmd:$cmd, dry_run:$dry_run}')"
+
+    if [[ "$DRY_RUN" == "true" ]]; then
+        jq -n --argjson cmd "$cmd_json" '{type:"dry_run", cmd:$cmd}'
+        exit 0
+    fi
+
+    "$@"
+}
+
+# ---------------------------------------------------------------------------
+# Actions
+# ---------------------------------------------------------------------------
+
+_update() {
+    case "$PM" in
+        apt-get) _run apt-get update ;;
+        dnf)     _run dnf check-update || true ;;
+        yum)     _run yum check-update || true ;;
+        apk)     _run apk update ;;
+    esac
+}
+
+_install() {
+    [[ "${#PKGS[@]}" -gt 0 ]] || _error "NO_PACKAGES" "install requires at least one package"
+
+    local pm_flags=()
+    local f
+    for f in "${FLAGS[@]+"${FLAGS[@]}"}"; do
+        case "$f" in
+            --no-weak-deps)
+                case "$PM" in
+                    apt-get) pm_flags+=("--no-install-recommends") ;;
+                    dnf|yum) pm_flags+=("--setopt=install_weak_deps=False") ;;
+                    apk)     ;; # Default behavior
+                esac
+                ;;
+            *)
+                pm_flags+=("$f")
+                ;;
+        esac
+    done
+
+    case "$PM" in
+        apt-get) _run apt-get install -y "${pm_flags[@]}" "${PKGS[@]}" ;;
+        dnf)     _run dnf     install -y "${pm_flags[@]}" "${PKGS[@]}" ;;
+        yum)     _run yum     install -y "${pm_flags[@]}" "${PKGS[@]}" ;;
+        apk)     _run apk     add        "${pm_flags[@]}" "${PKGS[@]}" ;;
+    esac
+
+    _emit "$(jq -n \
+        --arg     action   "install" \
+        --argjson packages "$PKGS_JSON" \
+        '{type:"journal", action:$action, packages:$packages}')"
+}
+
+_remove() {
+    [[ "${#PKGS[@]}" -gt 0 ]] || _error "NO_PACKAGES" "remove requires at least one package"
+
+    case "$PM" in
+        apt-get) _run apt-get remove -y "${PKGS[@]}" ;;
+        dnf)     _run dnf     remove -y "${PKGS[@]}" ;;
+        yum)     _run yum     remove -y "${PKGS[@]}" ;;
+        apk)     _run apk     del       "${PKGS[@]}" ;;
+    esac
+}
+
+_source() {
+    [[ "${#PKGS[@]}" -gt 0 ]] || _error "NO_PACKAGES" "source requires at least one package"
+
+    case "$PM" in
+        apt-get) _run apt-get source "${PKGS[@]}" ;;
+        *)       _error "UNSUPPORTED_ACTION" "source not supported on $PM" ;;
+    esac
+}
+
+_search() {
+    [[ "${#PKGS[@]}" -gt 0 ]] || _error "NO_PACKAGES" "search requires at least one package or pattern"
+
+    case "$PM" in
+        apt-get) _run apt-cache search "${PKGS[@]}" ;;
+        dnf)     _run dnf       search "${PKGS[@]}" ;;
+        yum)     _run yum       search "${PKGS[@]}" ;;
+        apk)     _run apk       search -v "${PKGS[@]}" ;;
+    esac
+}
+
+# ---------------------------------------------------------------------------
+# Main
+# ---------------------------------------------------------------------------
+
+# ---------------------------------------------------------------------------
+# Help
+# ---------------------------------------------------------------------------
+
+_help() {
+    cat <<'EOF'
+PKGCTL 0.1.0 — agent-oriented package management tool
+
+USAGE (agent / stdin mode — primary interface):
+  echo '<json>' | sudo pkgctl
+  sudo pkgctl < payload.json
+
+USAGE (human / CLI flags):
+  pkgctl --help | -h | -? | help
+
+DESCRIPTION:
+  pkgctl is a self-correcting package management wrapper designed for use as
+  an LLM/agent tool. It accepts a single JSON object on stdin, dispatches to
+  the host package manager (apt-get, dnf, yum, or apk), and emits
+  newline-delimited JSON events on stdout. All errors are emitted as structured
+  JSON on stderr with a non-zero exit code — never bare text.
+
+INPUT SCHEMA:
+  {
+    "action":   "install" | "remove" | "update" | "source" | "search",  // required
+    "packages": ["pkg1", "pkg2"],   // required for install, remove, source, search
+    "flags":    ["-y"],             // optional; see ALLOWED FLAGS
+    "dry_run":  false               // optional; log+return cmd, don't execute
+  }
+
+ACTIONS:
+  install   Install one or more packages
+  remove    Remove one or more packages
+  update    Refresh package index (no packages field)
+  source    Download package source (apt/apt-get only)
+  search    Search for packages or patterns
+
+ALLOWED FLAGS:
+  -y                      Pass -y / --yes to the package manager
+  --no-weak-deps          Skip optional/recommended dependencies (all managers)
+
+OUTPUT EVENT TYPES (stdout, newline-delimited JSON):
+  event     Command was dispatched; includes ts, pm, cmd, dry_run
+  journal   Post-install audit record; includes action and packages
+  dry_run   dry_run:true was set; command was not executed
+
+ERROR CODES (stderr, non-zero exit):
+  LOCKED              Another pkgctl instance is running
+  NO_JQ               jq is not installed
+  INVALID_SCHEMA      Input JSON failed schema validation
+  INVALID_ACTION      action not in allowed enum
+  INVALID_FLAG        Flag not in allowed whitelist
+  NO_PACKAGES         packages missing or empty for an action that requires it
+  UNSUPPORTED_SYSTEM  No supported package manager found on this host
+  UNSUPPORTED_ACTION  Requested action not supported by detected package manager
+
+EXAMPLES:
+  # Dry-run an install (always do this first):
+  echo '{"action":"install","packages":["curl","jq"],"dry_run":true}' | sudo pkgctl
+  
+  # Execute after confirming:
+  echo '{"action":"install","packages":["curl","jq"],"flags":["-y"]}' | sudo pkgctl
+  
+  # Refresh package index:
+  echo '{"action":"update"}' | sudo pkgctl
+  
+  # Remove a package:
+  echo '{"action":"remove","packages":["curl"],"dry_run":true}' | sudo pkgctl
+
+AGENT NOTES:
+  - This script is the tool target for LLM function-calling integrations.
+  - All output — success and failure — is structured JSON; no scraping needed.
+  - Always run 'update' before the first 'install', 'search', or 'source' in a new session. Not required before 'remove'.
+  - Always invoke with dry_run:true first and confirm before executing.
+  - The journal is written to: /tmp/pkgctl-journal.ndjson
+  - The lock file is:          /tmp/pkgctl.lock
+EOF
+}
+
+_schema() {
+    cat <<'EOF'
+[
+  {
+    "name": "PackageControl",
+    "description": "A robust, agent-oriented wrapper for managing system packages (install, remove, update, search, source) via the host package manager (apt/apt-get, dnf, yum, apk). Strictly stdin-based JSON. DO NOT execute via run_shell_command. Enforces a structured workflow: always run 'update' first in a new session. For 'install' and 'remove', use 'dry_run: true' first to inspect generated commands, then prompt the user for confirmation before executing with 'dry_run: false'.",
+    "parameters": {
+      "type": "object",
+      "properties": {
+        "action": {
+          "type": "string",
+          "enum": ["install", "remove", "update", "source", "search"],
+          "description": "The package management action to perform. 'update' synchronizes the package index; all other actions require the 'packages' parameter."
+        },
+        "packages": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "description": "List of package names or search patterns. REQUIRED for 'install', 'remove', 'source', and 'search'. Must be omitted or empty for 'update'."
+        },
+        "flags": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "description": "Optional command-line flags. Supported: '-y' (assume yes), '--no-weak-deps' (skip optional/recommended dependencies)."
+        },
+        "dry_run": {
+          "type": "boolean",
+          "description": "When true, returns the command that would be executed and logs the intent, without making any system changes. Use this for mandatory verification before destructive actions or installations."
+        }
+      },
+      "required": ["action"]
+    }
+  }
+]
+EOF
+}
+
+# ---------------------------------------------------------------------------
+# Main
+# ---------------------------------------------------------------------------
+
+# Handle help flags/subcommand before touching stdin or the package manager.
+# Supports: --help  -h  -?  help  (any position in argv)
+for _arg in "$@"; do
+    case "$_arg" in
+        --help|-h|-\?|help)
+            _help
+            exit 0
+            ;;
+        --schema)
+            _schema
+            exit 0
+            ;;
+    esac
+done
+unset _arg
+
+if [[ $EUID -ne 0 ]]; then
+    _error "NOT_ROOT" "this tool must be run as root (via sudo)"
+fi
+
+PM="$(_detect_pm)"
+[[ -n "$PM" ]] || _error "UNSUPPORTED_SYSTEM" "no supported package manager found"
+
+INPUT="$(cat)"
+
+_validate
+_extract
+_acquire_lock
+_extract_flags
+_extract_pkgs
+
+case "$ACTION" in
+    install) _install ;;
+    remove)  _remove  ;;
+    update)  _update  ;;
+    source)  _source  ;;
+    search)  _search  ;;
+    *)       _error "INVALID_ACTION" "must be install|remove|update|source|search" ;;
+esac
